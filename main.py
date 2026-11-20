@@ -1,24 +1,30 @@
-"""GTA VI trophy rarity forecast (make.fun gta6-trophy-rarity-forecast-01).
+"""Forecast GTA VI trophy earn rates on Exophase (make.fun gta6-trophy-rarity-forecast-01).
 
-Forecasts each trophy's Exophase earn rate at the case's target as five
-quantiles (5/25/50/75/95%) in percent, in logit space.
+Model v2: count-based, horizon-aware.
 
-Model (backtested on the two practice cases against simulated answers;
-see README for the honest backtest method):
-  * The tracked-players denominator grows (G_N): observed log-trend of
-    players_tracked extrapolated to the horizon, floored by a refresh
-    prior (one Exophase refresh batch ~5x on a short horizon, power-law
-    growth on a long horizon), capped at 10x.
-  * Median in logit space: dilution from denominator growth, partly
-    offset by catch-up earning. Fast trophies (early chapters, quick
-    activities) catch up much more than grind/collectible trophies.
-  * The 100% trophy (an artefact: every one of the first 638 tracked
-    players had it) is handled with a count model, not a logit from 99.99.
-  * Spread is deliberately wide: a refresh can move almost every rate,
-    so the band widens with horizon and carries an explicit refresh term.
+Idea: a rate is a fraction, earned / tracked. When Exophase's tracked-player
+count jumps (a refresh), the denominator grows and every rate is diluted, even
+though nobody "un-earns" a trophy. So instead of shifting logits, this model
+works in counts:
 
-Standard library only, deterministic, no network, no model calls.
-Run: MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+  * E_old -- players who already earned the trophy at the checkpoint:
+    rate_checkpoint * N_last / 100.
+  * N_target -- tracked players at the target: N_last * G, where G blends the
+    observed log-trend of players_tracked with a refresh prior (the first
+    observed refresh multiplied the tracked count ~6x).
+  * E_new -- new players who earn the trophy before the target:
+    (N_target - N_last) * f / 100, where f is the new cohort's earn rate,
+    a per-trophy fraction m of the checkpoint rate. Fast trophies (early story,
+    one-off activities) are picked up by newcomers much more than slow ones
+    (grinds, collectibles, 100% completion).
+  * Median forecast = (E_old + E_new) / N_target * 100.
+
+Quantiles are then spread around that median on the logit scale with a sigma
+that grows with the horizon and with whether a refresh is expected, so the
+90-minute practice horizon gets a much tighter band than the 4.5-day final.
+
+Standard library only, no network, no randomness: two runs on the same case
+are byte-identical.
 """
 
 import json
@@ -34,116 +40,126 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
+Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Launch epoch used by the refresh prior: 2026-11-19T00:00:00Z.
+# Reference moment for the refresh prior: launch-day midnight, UTC.
 EPOCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
-
-def clamp_pct(x: float) -> float:
-    return min(99.99, max(0.01, x))
-
-
-def logit(pct: float) -> float:
-    p = clamp_pct(pct)
-    return math.log(p / (100.0 - p))
-
-
-def inv_logit(lg: float) -> float:
-    if lg >= 0:
-        return 100.0 / (1.0 + math.exp(-lg))
-    e = math.exp(lg)
-    return 100.0 * e / (1.0 + e)
-
-
-def round4(x: float):
-    """Round to 4 decimals, half up (same as the starter's JS-style rule)."""
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if float(value).is_integer() else value
+# First observed refresh multiplied the tracked count by ~6.06 (638 -> 3868).
+FIRST_REFRESH_GROWTH = 6.0
+MAX_GROWTH = 10.0
 
 
 def parse_time(text: str) -> datetime:
+    """Parse an ISO-8601 timestamp ending in Z."""
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def fast_score(trophy: dict) -> float:
-    """How fast new players earn this trophy, 0 (very slow) to 1 (very fast).
+def hours_since_epoch(moment: datetime) -> float:
+    return max(1.0, (moment - EPOCH).total_seconds() / 3600.0)
 
-    Prior from tier + description keywords only; the observed history is
-    flat (every read identical), so no per-trophy earned-rate signal exists
-    to learn from — the prior is all we have, and the wide spread carries
-    the uncertainty.
-    """
-    name = trophy.get("name", "")
-    desc = (trophy.get("description") or "").lower()
-    tier = trophy.get("tier", "")
 
-    # Slowest: the endgame.
+def clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
+
+
+def logit(pct: float) -> float:
+    p = clamp(pct, 0.01, 99.99) / 100.0
+    return math.log(p / (1.0 - p))
+
+
+def inv_logit(x: float) -> float:
+    if x >= 0:
+        return 100.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return 100.0 * e / (1.0 + e)
+
+
+def round_half_up_4(x: float):
+    """Round to 4 decimals, halves away from zero (matches the starter's
+    JavaScript-style rounding), returning an int for whole numbers."""
+    scaled = math.floor(x * 10000.0 + 0.5) / 10000.0
+    return int(scaled) if scaled == int(scaled) else scaled
+
+
+def trend_growth(history, horizon_hours: float) -> float:
+    """Growth factor implied by the log-trend of players_tracked over the
+    reads in history, extrapolated over the horizon. Flat history -> 1.0."""
+    points = []
+    if not history:
+        return 1.0
+    t0 = parse_time(history[0]["at"])
+    for read in history:
+        n = read.get("players_tracked")
+        if n and n > 0:
+            hours = (parse_time(read["at"]) - t0).total_seconds() / 3600.0
+            points.append((hours, math.log(n)))
+    if len(points) < 2:
+        return 1.0
+    n_pts = len(points)
+    mean_t = sum(p[0] for p in points) / n_pts
+    mean_y = sum(p[1] for p in points) / n_pts
+    denom = sum((p[0] - mean_t) ** 2 for p in points)
+    if denom <= 0:
+        return 1.0
+    slope = sum((p[0] - mean_t) * (p[1] - mean_y) for p in points) / denom
+    return clamp(math.exp(slope * horizon_hours), 0.2, 50.0)
+
+
+def refresh_growth(horizon_minutes: float, t_checkpoint: float, t_target: float) -> float:
+    """Prior for the tracked-count jump caused by an Exophase refresh.
+
+    Short horizons (< 6 h) sit inside the first refresh batch, which
+    multiplied the count ~6x. Longer horizons grow more slowly, roughly as a
+    power of elapsed time since launch."""
+    if horizon_minutes < 360.0:
+        return FIRST_REFRESH_GROWTH
+    return (t_target / t_checkpoint) ** 1.2
+
+
+def fast_score(description: str, tier: str) -> float:
+    """How quickly a newcomer picks up this trophy, 0 (very slow) to 1 (very
+    fast). Built from the trophy's tier and the wording of its description:
+    story chapters and one-off activities are fast; grinds, collectibles and
+    completionist trophies are slow; money trophies sit in the middle."""
+    text = (description or "").lower()
+    tier = (tier or "").lower()
+
     if tier == "platinum":
-        return 0.15
-    if "100% completion" in desc or "final mission" in desc:
-        return 0.15
-
-    # Grind / collectibles: many repetitions, slow even over 4.5 days.
-    grind = (
-        "250 stunts" in desc
-        or "100 vehicles" in desc
-        or "50 challenges" in desc
-        or "100 locations" in desc
-        or "card sets" in desc
-        or "20 different races" in desc
-        or "gold medal in all" in desc
-        or "every location" in desc
-        or "8 mission strands" in desc
-        or "meditate at every spot" in desc
-        or "explore all of leonida" in desc
-        or "rob 5 bank vaults" in desc
-        or "register 10 vehicles" in desc
-    )
-    if grind:
-        return 0.3
-
-    # Money trophies: need cash first, mid-speed.
-    if "laundering" in desc or "spend $100,000" in desc:
-        return 0.4
-    if "purchase all garage" in desc:
-        return 0.35
-
-    # Story chapters: early chapters are reached in the first hours.
-    if "complete chapter 1" in desc:
-        return 0.85
-    if "complete chapter 2" in desc:
-        return 0.75
-    if "complete chapter 3" in desc:
+        return 0.05
+    if "100% completion" in text:
+        return 0.05
+    if "final mission for" in text:
         return 0.7
-    if "complete chapter 4" in desc:
-        return 0.65
+    if "final mission" in text:
+        return 0.1
 
-    # Quick one-off activities, usually done in the first session.
-    quick = (
-        "gone fishing" in desc
-        or "arcade game" in desc
-        or "cocktail" in desc
-        or "bowling" in desc
-        or "try each type of activity" in desc
-        or "fishing challenge" in desc
+    for chapter, score in (("chapter 1", 0.85), ("chapter 2", 0.75),
+                           ("chapter 3", 0.70), ("chapter 4", 0.65)):
+        if chapter in text:
+            return score
+
+    slow_markers = (
+        "stunts", "collectible card", "100 locations", "50 challenges",
+        "20 different races", "gold medal in all", "every location",
+        "8 mission strands", "meditate", "explore all of",
+        "rob 5 bank", "register 10 vehicles", "discover 100 vehicles",
     )
-    if quick:
+    if any(marker in text for marker in slow_markers):
+        return 0.1
+
+    money_markers = ("laundering", "spend $100,000", "purchase all garage")
+    if any(marker in text for marker in money_markers):
+        return 0.4
+
+    quick_markers = ("fishing", "arcade", "cocktail", "bowl",
+                     "try each type of activity")
+    if any(marker in text for marker in quick_markers):
         return 0.9
 
-    # Named story missions and other single activities: mid-fast.
-    # (Check the "final mission for <person>" strands before the generic
-    # "Complete ..." rule, so they are not swallowed by it.)
-    if "complete the final mission for" in desc:
-        return 0.7
-    if desc.startswith("complete "):
+    if text.startswith("complete "):
         return 0.7
 
-    # Fallback by tier.
     if tier == "gold":
         return 0.3
     if tier == "silver":
@@ -151,36 +167,22 @@ def fast_score(trophy: dict) -> float:
     return 0.6
 
 
-def growth_factor(case: dict) -> float:
-    """G_N: players_tracked at target divided by players_tracked at last read."""
-    reads = case["history"]
-    n_last = reads[-1]["players_tracked"]
-    horizon_days = case["horizon_minutes"] / 1440.0
+def spread_sigma(horizon_days: float) -> float:
+    """Logit-scale sigma of the forecast band. A refresh inside the horizon
+    adds uncertainty; a multi-day horizon is genuinely much less certain
+    than a 90-minute one."""
+    refresh = 0.40 if horizon_days < 0.5 else 0.80
+    variance = 0.30 ** 2 + (0.40 * math.sqrt(horizon_days)) ** 2 + refresh ** 2
+    return min(1.5, math.sqrt(variance))
 
-    # Observed trend: log growth per day across the history window.
-    g_trend = 1.0
-    if len(reads) >= 2:
-        n_first = reads[0]["players_tracked"]
-        t_first = parse_time(reads[0]["slot"])
-        t_last = parse_time(reads[-1]["slot"])
-        span_days = max((t_last - t_first).total_seconds(), 0.0) / 86400.0
-        if span_days > 0 and n_first > 0 and n_last > n_first:
-            rate_per_day = math.log(n_last / n_first) / span_days
-            g_trend = math.exp(rate_per_day * horizon_days)
 
-    # Refresh prior: Exophase refreshes in batches, not continuously.
-    horizon_hours = case["horizon_minutes"] / 60.0
-    if horizon_hours < 6:
-        g_refresh = 5.0
-    else:
-        at = parse_time(case["at"])
-        target = parse_time(case["target"])
-        t_checkpoint = max((at - EPOCH).total_seconds() / 3600.0, 1.0)
-        t_target = max((target - EPOCH).total_seconds() / 3600.0, 1.0)
-        g_refresh = (t_target / t_checkpoint) ** 1.2
-
-    g = max(g_trend, g_refresh)
-    return min(g, 10.0)
+def last_known_rate(history, index: int):
+    """The trophy's rate in the latest read that lists it, else None."""
+    for read in reversed(history):
+        rates = read.get("rates") or []
+        if index < len(rates) and rates[index] is not None:
+            return rates[index]
+    return None
 
 
 def forecast_case(case: dict, name: str) -> dict:
@@ -189,46 +191,59 @@ def forecast_case(case: dict, name: str) -> dict:
     if not case["history"]:
         raise ValueError(f"{name} has no history")
 
-    last = case["history"][-1]
-    n_last = last["players_tracked"]
-    horizon_days = case["horizon_minutes"] / 1440.0
-    g_n = growth_factor(case)
-    n_target = n_last * g_n
+    history = case["history"]
+    n_last = None
+    for read in reversed(history):
+        if read.get("players_tracked"):
+            n_last = read["players_tracked"]
+            break
+    if n_last is None:
+        raise ValueError(f"{name} has no players_tracked in its history")
+    horizon_minutes = float(case["horizon_minutes"])
+    horizon_days = horizon_minutes / 1440.0
+    horizon_hours = horizon_minutes / 60.0
 
-    # Spread in logit units: base uncertainty + random-walk growth with
-    # horizon + an explicit refresh term (a refresh batch moves rates a lot).
-    refresh = 0.9 if horizon_days < 0.5 else 1.3
-    sigma = min(2.0, math.sqrt(0.55 ** 2 + (0.75 * math.sqrt(horizon_days)) ** 2 + refresh ** 2))
+    t_checkpoint = hours_since_epoch(parse_time(case["at"]))
+    t_target = hours_since_epoch(parse_time(case["target"]))
+
+    g_trend = trend_growth(history, horizon_hours)
+    g_refresh = refresh_growth(horizon_minutes, t_checkpoint, t_target)
+    growth = min(max(g_trend, g_refresh), MAX_GROWTH)
+    n_target = n_last * growth
+    newcomers = n_target - n_last
+
+    sigma = spread_sigma(horizon_days)
 
     rows = []
     for i, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][i]
+        rate = last_known_rate(history, i)
         if rate is None:
             rate = 0.0
-        fast = fast_score(trophy)
 
-        if rate >= 99.5:
-            # Artefact trophy: ~100% only because every early tracked player
-            # had it. Model counts: old players keep it, new players earn it
-            # at a rate that rises slowly with horizon.
-            q_new = 0.6 * horizon_days / (horizon_days + 3.0)
-            median = (n_last * 1.0 + (n_target - n_last) * q_new) / n_target * 100.0
+        if rate >= 99.99:
+            # Everybody already has it: only newcomers can still be missing
+            # it, and a share of them catch up over the horizon.
+            catch_up = 0.6 * horizon_days / (horizon_days + 3.0)
+            median = (n_last * 1.0 + newcomers * catch_up) / n_target * 100.0
         else:
-            beta = 0.2 + 1.0 * fast
-            shift = -math.log(g_n) * (1.0 - 0.25 * fast) + beta * math.log1p(horizon_days)
-            median = inv_logit(logit(rate) + shift)
+            speed = fast_score(trophy.get("description", ""), trophy.get("tier", ""))
+            catch_up_fraction = 0.02 + 0.35 * speed
+            earned_old = rate * n_last / 100.0
+            earned_new = newcomers * (rate * catch_up_fraction) / 100.0
+            median = (earned_old + earned_new) / n_target * 100.0
 
-        median = min(99.99, max(0.01, median))
-        lg_med = logit(median)
-        qs = []
-        prev = 0.0
-        for z in Z:
-            q = inv_logit(lg_med + z * sigma)
-            q = round4(min(100.0, max(0.0, q)))
-            q = max(q, prev)  # keep quantiles non-decreasing after rounding
-            qs.append(q)
-            prev = q
-        rows.append({"id": trophy["id"], "q": qs})
+        centre = logit(clamp(median, 0.01, 99.99))
+        quantiles = []
+        previous = 0.0
+        for z in Z_SCORES:
+            value = clamp(inv_logit(centre + z * sigma), 0.0, 100.0)
+            value = round_half_up_4(value)
+            # Rounding must not break the non-decreasing order.
+            if value < previous:
+                value = previous
+            quantiles.append(value)
+            previous = value
+        rows.append({"id": trophy["id"], "q": quantiles})
     return {"trophies": rows}
 
 
